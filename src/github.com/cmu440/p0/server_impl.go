@@ -1,10 +1,5 @@
 package p0
 
-// 1. How to destroy go routines by callback?
-
-// 2. how to broadcast the message to all clients?
-// 3.
-
 import (
 	"bufio"
 	"bytes"
@@ -12,11 +7,11 @@ import (
 	"io"
 	"net"
 	"strconv"
+	"strings"
 )
 
 const (
 	inboxBuffSize = 500
-	nPublisher    = 4
 	putOp         = "put"
 	getOp         = "get"
 	addCli        = "addCli"
@@ -80,6 +75,8 @@ func (kvs *keyValueServer) Broadcast() {
 // It is responsible for accepting the connection and append,
 // and delete the connection list. There should be only one thread running this function.
 func (kvs *keyValueServer) AcceptClients() {
+	defer kvs.listener.Close()
+
 	for !kvs.done {
 		conn, err := kvs.listener.Accept()
 		if conn == nil {
@@ -87,21 +84,24 @@ func (kvs *keyValueServer) AcceptClients() {
 			continue
 		}
 
-		cli := &client{conn: conn}
+		cli := &client{conn: conn, inBox: make(chan []byte, inboxBuffSize)}
 		kvs.cliIOChan <- cliIO{addCli, cli}
 		go kvs.HandleClient(cli)
 	}
+
 }
 
 func (kvs *keyValueServer) UpdateKvStore() {
 	for !kvs.done {
-
 		switch cliReq := <-kvs.cliReqChan; cliReq.op {
+
 		case putOp:
 			put(cliReq.kvp.key, cliReq.kvp.value)
 		case getOp:
 			value := get(cliReq.kvp.key)
-			kvs.broadcastChan <- bytes.Join([][]byte{[]byte("key"), value}, []byte(","))
+			kvs.broadcastChan <- bytes.Join([][]byte{[]byte(cliReq.kvp.key), value}, []byte(","))
+		default:
+			panic("something when wrong in cliReq")
 		}
 	}
 }
@@ -113,6 +113,7 @@ func (kvs *keyValueServer) ManageClients() {
 		case addCli:
 			kvs.clients[cliIO.cli] = true
 		case delCli:
+			cliIO.cli.conn.Close()
 			delete(kvs.clients, cliIO.cli)
 		}
 	}
@@ -151,7 +152,7 @@ func (kvs *keyValueServer) Count() int {
 func inBoxConsumer(cli *client) {
 	for !cli.done {
 		msg := <-cli.inBox
-		if _, err := cli.conn.Write([]byte(msg)); err != nil {
+		if _, err := cli.conn.Write(append([]byte(msg), []byte("\n")...)); err != nil {
 			panic(err)
 		}
 	}
@@ -165,31 +166,38 @@ func (kvs *keyValueServer) HandleClient(cli *client) {
 	}()
 
 	go inBoxConsumer(cli)
+	reader := bufio.NewReader(cli.conn)
 
 	for !kvs.done {
-		reader := bufio.NewReader(cli.conn)
 		msg, err := reader.ReadBytes('\n')
 		if err == io.EOF {
 			return
 		} else if err != nil {
-			panic(err)
+			fmt.Println("Something wrong, host should close connection", err, cli.conn)
+			return
 		}
 
-		firstComma := bytes.Index(msg, []byte(","))
-		op := string(msg[:firstComma])
+		// TODO: better way to parse it?
+		line := strings.Split(strings.TrimSuffix(string(msg), "\n"), ",")
+		if len(line) < 2 {
+			fmt.Println("Invalid request from", cli.conn)
+			return
+		}
+		op := line[0]
+		key := line[1]
 
 		switch op {
 		case putOp:
-			secondComma := firstComma + bytes.Index(msg[firstComma+1:], []byte(",")) + 1
-			key := string(msg[firstComma+1 : secondComma])
-			value := msg[secondComma+1:]
+			if len(line) != 3 {
+				fmt.Println("Invalid request", cli.conn)
+				return
+			}
+			value := []byte(line[2])
 			kvs.cliReqChan <- cliReq{putOp, &kvPair{key, value}}
 		case getOp:
-			key := string(msg[firstComma+1:])
 			kvs.cliReqChan <- cliReq{getOp, &kvPair{key, nil}}
 		default:
-			panic("unexpected request!")
+			fmt.Println("Invalid request", cli.conn)
 		}
-
 	}
 }
