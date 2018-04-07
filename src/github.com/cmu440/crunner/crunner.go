@@ -1,12 +1,17 @@
 package main
 
 import (
-    "fmt"
+	"bufio"
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"strconv"
 )
 
 const (
-    defaultHost = "localhost"
-    defaultPort = 9999
+	defaultHost = "localhost"
+	defaultPort = 9999
 )
 
 // To test your server implementation, you might find it helpful to implement a
@@ -15,5 +20,42 @@ const (
 // read and print out the server's response to standard output. Whether or
 // not you add any code to this file will not affect your grade.
 func main() {
-    fmt.Println("Not implemented.")
+
+	if addr, err := net.ResolveTCPAddr("tcp", defaultHost+":"+strconv.Itoa(defaultPort)); err != nil {
+		panic("Cannot resolve ")
+	} else if conn, err := net.DialTCP("tcp", nil, addr); err != nil {
+		panic("Cannot dial ")
+	} else {
+		userInput := bufio.NewReader(os.Stdin)
+		response := bufio.NewReader(conn)
+		go func() {
+			for {
+				serverLine, err := response.ReadBytes(byte('\n'))
+				switch err {
+				case nil:
+					fmt.Print(string(serverLine))
+				case io.EOF:
+					os.Exit(0)
+				default:
+					fmt.Println("ERROR", err)
+					os.Exit(2)
+				}
+			}
+
+		}()
+		for {
+			userLine, err := userInput.ReadBytes(byte('\n'))
+			switch err {
+			case nil:
+				conn.Write(userLine)
+			case io.EOF:
+				os.Exit(0)
+			default:
+				fmt.Println("ERROR", err)
+				os.Exit(1)
+			}
+		}
+
+	}
+
 }
