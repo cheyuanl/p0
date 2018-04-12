@@ -58,17 +58,21 @@ type cliMng struct {
 }
 
 type cliManager struct {
-	clients  map[*client]bool // keep track of the connections
-	mangChan chan cliMng      // cahnnel for client managment events
-	done     chan bool
+	clients    map[*client]bool // keep track of the connections
+	mangChan   chan cliMng      // cahnnel for client managment events
+	cliReqChan chan bool
+	cliGetChan chan []*client
+	done       chan bool
 }
 
 // This is responsible for managing the connected clients
 func NewCliManager() *cliManager {
 	return &cliManager{
-		clients:  make(map[*client]bool),
-		mangChan: make(chan cliMng),
-		done:     make(chan bool)}
+		clients:    make(map[*client]bool),
+		mangChan:   make(chan cliMng),
+		cliReqChan: make(chan bool),
+		cliGetChan: make(chan []*client),
+		done:       make(chan bool)}
 }
 
 func (cm *cliManager) Start() {
@@ -81,16 +85,23 @@ func (cm *cliManager) Start() {
 			case delCli:
 				if _, ok := cm.clients[mng.cli]; ok {
 					delete(cm.clients, mng.cli)
-					// mng.cli.conn.Close()
+					mng.cli.conn.Close()
 				}
 			default:
 				panic("something wrong.")
 			}
 
+		case <-cm.cliReqChan:
+			keys := make([]*client, 0, len(cm.clients))
+			for cli := range cm.clients {
+				keys = append(keys, cli)
+			}
+			cm.cliGetChan <- keys
+
 		case <-cm.done:
 			for cli := range cm.clients {
 				delete(cm.clients, cli)
-				// cli.conn.Close()
+				cli.conn.Close()
 			}
 			return
 		}
@@ -109,8 +120,9 @@ func (cm *cliManager) Delete(cli *client) {
 	cm.mangChan <- cliMng{delCli, cli}
 }
 
-func (cm *cliManager) Count() int {
-	return len(cm.clients)
+func (cm *cliManager) GetClients() []*client {
+	cm.cliReqChan <- true
+	return <-cm.cliGetChan
 }
 
 type keyValueServer struct {
@@ -170,7 +182,7 @@ func (kvs *keyValueServer) Close() {
 }
 
 func (kvs *keyValueServer) Count() int {
-	return kvs.cliManager.Count()
+	return len(kvs.cliManager.GetClients())
 }
 
 func (kvs *keyValueServer) ReadClientConn(cli *client) {
@@ -216,7 +228,7 @@ func (kvs *keyValueServer) WriteClientConn(cli *client) {
 
 	for {
 		msg := <-cli.inBox
-		if _, err := cli.conn.Write(append([]byte(msg), []byte("\n")...)); err != nil {
+		if _, err := cli.conn.Write(msg); err != nil {
 			return
 		}
 	}
@@ -227,15 +239,10 @@ func (kvs *keyValueServer) Broadcast() {
 	for {
 		select {
 		case msg := <-kvs.broadcastChan:
-			// TODO: Concurrent access of clients?
-			for cli := range kvs.cliManager.clients {
-				cli := cli
-				go func() {
-					if len(cli.inBox) < inboxBuffSize {
-						cli.inBox <- msg
-					}
-				}()
-
+			for _, cli := range kvs.cliManager.GetClients() {
+				if cli != nil && len(cli.inBox) < inboxBuffSize {
+					cli.inBox <- append([]byte(msg), []byte("\n")...)
+				}
 				// drop the msg if the inbox is full
 			}
 		case <-kvs.broadcDone:
