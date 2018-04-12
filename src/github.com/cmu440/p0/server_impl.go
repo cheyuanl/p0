@@ -12,6 +12,7 @@
  *   that send response to the minBoxChans of cliMngPool.
  *
  * @author Che-Yuan Liang Apr. 2018
+ * Issue: channel deadlock when producer is done and waiting for consumer.
  */
 
 package p0
@@ -20,7 +21,6 @@ import (
 	"bufio"
 	"bytes"
 	"fmt"
-	"io"
 	"net"
 	"strconv"
 	"strings"
@@ -40,9 +40,9 @@ type kvPair struct {
 }
 
 type client struct {
-	conn  net.Conn
-	inBox chan []byte // the message queue to be consumed by client
-	done  bool
+	conn       net.Conn
+	inBox      chan []byte // the message queue to be consumed by client
+	readerChan chan []byte
 }
 
 // The client request event
@@ -51,30 +51,85 @@ type cliReq struct {
 	kvp *kvPair
 }
 
-// The client management event
+// Concurrent client connection management
 type cliMng struct {
 	op  string
 	cli *client
 }
 
+type cliManager struct {
+	clients  map[*client]bool // keep track of the connections
+	mangChan chan cliMng      // cahnnel for client managment events
+	done     chan bool
+}
+
+// This is responsible for managing the connected clients
+func NewCliManager() *cliManager {
+	return &cliManager{
+		clients:  make(map[*client]bool),
+		mangChan: make(chan cliMng),
+		done:     make(chan bool)}
+}
+
+func (cm *cliManager) Start() {
+	for {
+		select {
+		case mng := <-cm.mangChan:
+			switch mng.op {
+			case addCli:
+				cm.clients[mng.cli] = true
+			case delCli:
+				if _, ok := cm.clients[mng.cli]; ok {
+					delete(cm.clients, mng.cli)
+					// mng.cli.conn.Close()
+				}
+			default:
+				panic("something wrong.")
+			}
+
+		case <-cm.done:
+			for cli := range cm.clients {
+				delete(cm.clients, cli)
+				// cli.conn.Close()
+			}
+			return
+		}
+	}
+}
+
+func (cm *cliManager) Close() {
+	cm.done <- true
+}
+
+func (cm *cliManager) Add(cli *client) {
+	cm.mangChan <- cliMng{addCli, cli}
+}
+
+func (cm *cliManager) Delete(cli *client) {
+	cm.mangChan <- cliMng{delCli, cli}
+}
+
+func (cm *cliManager) Count() int {
+	return len(cm.clients)
+}
+
 type keyValueServer struct {
-	listener   net.Listener
-	cliMngPool map[*client]bool // keep track of the connections
-
+	listener      net.Listener
+	cliManager    *cliManager
 	cliReqChan    chan cliReq // channel for client request events
-	cliMngChan    chan cliMng // cahnnel for client managment events
 	broadcastChan chan []byte // channel for message to be broadcasted
-
-	done bool
+	updateDone    chan bool
+	broadcDone    chan bool
 }
 
 // New creates and returns (but does not start) a new KeyValueServer.
 func New() KeyValueServer {
 	return &keyValueServer{
-		cliMngPool:    make(map[*client]bool),
+		cliManager:    NewCliManager(),
 		cliReqChan:    make(chan cliReq),
 		broadcastChan: make(chan []byte),
-		cliMngChan:    make(chan cliMng),
+		updateDone:    make(chan bool),
+		broadcDone:    make(chan bool),
 	}
 }
 
@@ -93,7 +148,7 @@ func (kvs *keyValueServer) Start(port int) error {
 	go kvs.AcceptClients()
 
 	// fan-in
-	go kvs.ManageClients()
+	go kvs.cliManager.Start()
 
 	go kvs.UpdateKvStore()
 
@@ -105,40 +160,27 @@ func (kvs *keyValueServer) Start(port int) error {
 
 // shutdown all go routines and the server
 func (kvs *keyValueServer) Close() {
-	// destroy the routines created at start()
-	kvs.done = true
+	// destroy listener
+	kvs.listener.Close()
+	// destroy all client connections
+	kvs.cliManager.Close()
+	// destroy all other go routines
+	kvs.updateDone <- true
+	kvs.broadcDone <- true
 }
 
 func (kvs *keyValueServer) Count() int {
-	return len(kvs.cliMngPool)
+	return kvs.cliManager.Count()
 }
 
-// Client consume the inbox
-func (cli *client) ConsumeCliInbox() {
-	for !cli.done {
-		msg := <-cli.inBox
-		if _, err := cli.conn.Write(append([]byte(msg), []byte("\n")...)); err != nil {
-			panic(err)
-		}
-	}
-}
-
-func (kvs *keyValueServer) ProduceCliReq(cli *client) {
-	// shut down client connction
-	defer func() {
-		// produce cliMng event
-		kvs.cliMngChan <- cliMng{delCli, cli}
-	}()
+func (kvs *keyValueServer) ReadClientConn(cli *client) {
+	defer kvs.cliManager.Delete(cli)
 
 	reader := bufio.NewReader(cli.conn)
-
-	for !kvs.done {
+	for {
 		// read bytes
 		msg, err := reader.ReadBytes('\n')
-		if err == io.EOF {
-			return
-		} else if err != nil {
-			fmt.Println("Something wrong, host should close connection", err, cli.conn)
+		if err != nil {
 			return
 		}
 
@@ -169,15 +211,35 @@ func (kvs *keyValueServer) ProduceCliReq(cli *client) {
 	}
 }
 
+func (kvs *keyValueServer) WriteClientConn(cli *client) {
+	defer kvs.cliManager.Delete(cli)
+
+	for {
+		msg := <-cli.inBox
+		if _, err := cli.conn.Write(append([]byte(msg), []byte("\n")...)); err != nil {
+			return
+		}
+	}
+}
+
 // Consume the messages from broadcastChan and produce it to each inbox.
 func (kvs *keyValueServer) Broadcast() {
-	for !kvs.done {
-		msg := <-kvs.broadcastChan
-		for cli := range kvs.cliMngPool {
-			if len(cli.inBox) < inboxBuffSize {
-				cli.inBox <- msg
+	for {
+		select {
+		case msg := <-kvs.broadcastChan:
+			// TODO: Concurrent access of clients?
+			for cli := range kvs.cliManager.clients {
+				cli := cli
+				go func() {
+					if len(cli.inBox) < inboxBuffSize {
+						cli.inBox <- msg
+					}
+				}()
+
+				// drop the msg if the inbox is full
 			}
-			// drop the msg if the inbox is full
+		case <-kvs.broadcDone:
+			return
 		}
 	}
 }
@@ -186,55 +248,40 @@ func (kvs *keyValueServer) AcceptClients() {
 	if kvs.listener == nil {
 		panic("listener is nil")
 	}
-	defer kvs.listener.Close()
 
-	for !kvs.done {
+	for {
+		// This blocking call will return err went kvs.Close() is called
 		conn, err := kvs.listener.Accept()
-		if conn == nil {
-			fmt.Println(err)
-			continue
+		if err != nil {
+			return
 		}
 
-		cli := &client{conn: conn, inBox: make(chan []byte, inboxBuffSize)}
-		kvs.cliMngChan <- cliMng{addCli, cli}
-
-		go kvs.ProduceCliReq(cli)
-		go cli.ConsumeCliInbox()
+		cli := &client{conn: conn,
+			inBox:      make(chan []byte, inboxBuffSize),
+			readerChan: make(chan []byte),
+		}
+		kvs.cliManager.Add(cli)
+		go kvs.ReadClientConn(cli)
+		go kvs.WriteClientConn(cli)
 	}
 
 }
 
 func (kvs *keyValueServer) UpdateKvStore() {
-	for !kvs.done {
-		switch cliReq := <-kvs.cliReqChan; cliReq.op {
-		case putOp:
-			put(cliReq.kvp.key, cliReq.kvp.value)
-		case getOp:
-			value := get(cliReq.kvp.key)
-			kvs.broadcastChan <- bytes.Join([][]byte{[]byte(cliReq.kvp.key), value}, []byte(","))
-		default:
-			panic("something when wrong with cliReq producer")
+	for {
+		select {
+		case <-kvs.updateDone:
+			return
+		case cliReq := <-kvs.cliReqChan:
+			switch cliReq.op {
+			case putOp:
+				put(cliReq.kvp.key, cliReq.kvp.value)
+			case getOp:
+				value := get(cliReq.kvp.key)
+				kvs.broadcastChan <- bytes.Join([][]byte{[]byte(cliReq.kvp.key), value}, []byte(","))
+			default:
+				panic("something when wrong with cliReq producer")
+			}
 		}
 	}
-}
-
-func (kvs *keyValueServer) ManageClients() {
-	// destroy all client connections
-	defer func() {
-		for cli := range kvs.cliMngPool {
-			cli.done = true
-		}
-	}()
-
-	for !kvs.done {
-		cliMng := <-kvs.cliMngChan
-		switch cliMng.op {
-		case addCli:
-			kvs.cliMngPool[cliMng.cli] = true
-		case delCli:
-			cliMng.cli.done = true
-			delete(kvs.cliMngPool, cliMng.cli)
-		}
-	}
-
 }
