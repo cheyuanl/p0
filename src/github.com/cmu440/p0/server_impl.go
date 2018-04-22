@@ -1,18 +1,18 @@
 /**
- * This key-value storage server handles multiple cliMngPool concurrently and broadcasts
- * the response to cliMngPool. The sychronizations are handled by golang built-in channels.
+ * This key-value storage server handles clients concurrently and broadcasts
+ * the get response to all clients. The synchronization is handled by go channel.
  *
  * The message flow works as follows:
  * 1. Fan-in stage
- * 	 Multiple clients produce requests to the cliReqChan.
- *   The cliReqChan is consumed by UpdateKvstore routine that runs in single thread to ensure
- *   serial access of hashtable.
+ *    Clients produce requests to the cliReqChan.
+ *    The cliReqChan is consumed by UpdateKvstore routine that runs in single thread to ensure
+ *    serial access of a hashtable.
  * 2. Fan-out stage
- *   UpdateKvstore produces the msg to the broadcastChan, which is consumed by Broatcast routine
- *   that send response to the minBoxChans of cliMngPool.
+ *    UpdateKvstore produces the msg to the broadcastChan, which is consumed by Broatcast routine
+ *    that produces responses to the inBox of each client.
  *
  * @author Che-Yuan Liang Apr. 2018
- * Issue: channel deadlock when producer is done and waiting for consumer.
+ * @issue  Normal writer sometimes writes slow and drop msg (cli.inbox consumes slow. why?)
  */
 
 package p0
@@ -34,43 +34,51 @@ const (
 	delCli        = "delCli"
 )
 
+// Key value pair
 type kvPair struct {
 	key   string
 	value []byte
 }
 
+// Client
 type client struct {
-	conn       net.Conn
-	inBox      chan []byte // the message queue to be consumed by client
-	readerChan chan []byte
+	conn  net.Conn
+	inBox chan []byte // the message queue to be consumed by client
 }
 
-// The client request event
+// Client request event
 type cliReq struct {
 	op  string
 	kvp *kvPair
 }
 
-// Concurrent client connection management
+// Client management event
 type cliMng struct {
 	op  string
 	cli *client
 }
 
+// CliManager is responsible for managing the connected clients
+type CliManager interface {
+	Start()
+	Close()
+	Add(cli *client)
+	Delete(cli *client)
+	GetClients() []*client
+}
+
 type cliManager struct {
 	clients    map[*client]bool // keep track of the connections
-	mangChan   chan cliMng      // cahnnel for client managment events
-	cliReqChan chan bool
-	cliGetChan chan []*client
+	mngChan    chan cliMng      // channel for client management events
+	cliGetChan chan []*client   // channel for get client request
 	done       chan bool
 }
 
-// This is responsible for managing the connected clients
-func NewCliManager() *cliManager {
+// NewCliManager is responsible for managing the connected clients
+func NewCliManager() CliManager {
 	return &cliManager{
 		clients:    make(map[*client]bool),
-		mangChan:   make(chan cliMng),
-		cliReqChan: make(chan bool),
+		mngChan:    make(chan cliMng),
 		cliGetChan: make(chan []*client),
 		done:       make(chan bool)}
 }
@@ -78,29 +86,34 @@ func NewCliManager() *cliManager {
 func (cm *cliManager) Start() {
 	for {
 		select {
-		case mng := <-cm.mangChan:
+		// add or delete a single client conn
+		case mng := <-cm.mngChan:
 			switch mng.op {
 			case addCli:
 				cm.clients[mng.cli] = true
 			case delCli:
 				if _, ok := cm.clients[mng.cli]; ok {
 					delete(cm.clients, mng.cli)
+					close(mng.cli.inBox)
 					mng.cli.conn.Close()
 				}
 			default:
 				panic("something wrong.")
 			}
 
-		case <-cm.cliReqChan:
+		// get an array of client pointers
+		case <-cm.cliGetChan:
 			keys := make([]*client, 0, len(cm.clients))
 			for cli := range cm.clients {
 				keys = append(keys, cli)
 			}
 			cm.cliGetChan <- keys
 
+		// delete all client connection
 		case <-cm.done:
 			for cli := range cm.clients {
 				delete(cm.clients, cli)
+				close(cli.inBox)
 				cli.conn.Close()
 			}
 			return
@@ -113,21 +126,21 @@ func (cm *cliManager) Close() {
 }
 
 func (cm *cliManager) Add(cli *client) {
-	cm.mangChan <- cliMng{addCli, cli}
+	cm.mngChan <- cliMng{addCli, cli}
 }
 
 func (cm *cliManager) Delete(cli *client) {
-	cm.mangChan <- cliMng{delCli, cli}
+	cm.mngChan <- cliMng{delCli, cli}
 }
 
 func (cm *cliManager) GetClients() []*client {
-	cm.cliReqChan <- true
+	cm.cliGetChan <- nil
 	return <-cm.cliGetChan
 }
 
 type keyValueServer struct {
 	listener      net.Listener
-	cliManager    *cliManager
+	cliManager    CliManager
 	cliReqChan    chan cliReq // channel for client request events
 	broadcastChan chan []byte // channel for message to be broadcasted
 	updateDone    chan bool
@@ -174,8 +187,10 @@ func (kvs *keyValueServer) Start(port int) error {
 func (kvs *keyValueServer) Close() {
 	// destroy listener
 	kvs.listener.Close()
+
 	// destroy all client connections
 	kvs.cliManager.Close()
+
 	// destroy all other go routines
 	kvs.updateDone <- true
 	kvs.broadcDone <- true
@@ -186,7 +201,9 @@ func (kvs *keyValueServer) Count() int {
 }
 
 func (kvs *keyValueServer) ReadClientConn(cli *client) {
-	defer kvs.cliManager.Delete(cli)
+	defer func() {
+		kvs.cliManager.Delete(cli)
+	}()
 
 	reader := bufio.NewReader(cli.conn)
 	for {
@@ -214,8 +231,10 @@ func (kvs *keyValueServer) ReadClientConn(cli *client) {
 			}
 			value := []byte(line[2])
 			kvs.cliReqChan <- cliReq{putOp, &kvPair{key, value}}
+
 		case getOp:
 			kvs.cliReqChan <- cliReq{getOp, &kvPair{key, nil}}
+
 		default:
 			fmt.Println("Invalid request", cli.conn)
 			return
@@ -224,10 +243,16 @@ func (kvs *keyValueServer) ReadClientConn(cli *client) {
 }
 
 func (kvs *keyValueServer) WriteClientConn(cli *client) {
-	defer kvs.cliManager.Delete(cli)
+	defer func() {
+		kvs.cliManager.Delete(cli)
+	}()
 
 	for {
 		msg := <-cli.inBox
+		// if inBox chan is closed, msg is nil
+		if msg == nil {
+			return
+		}
 		if _, err := cli.conn.Write(msg); err != nil {
 			return
 		}
@@ -264,14 +289,13 @@ func (kvs *keyValueServer) AcceptClients() {
 		}
 
 		cli := &client{conn: conn,
-			inBox:      make(chan []byte, inboxBuffSize),
-			readerChan: make(chan []byte),
+			inBox: make(chan []byte, inboxBuffSize),
 		}
 		kvs.cliManager.Add(cli)
 		go kvs.ReadClientConn(cli)
 		go kvs.WriteClientConn(cli)
-	}
 
+	}
 }
 
 func (kvs *keyValueServer) UpdateKvStore() {
@@ -285,9 +309,14 @@ func (kvs *keyValueServer) UpdateKvStore() {
 				put(cliReq.kvp.key, cliReq.kvp.value)
 			case getOp:
 				value := get(cliReq.kvp.key)
-				kvs.broadcastChan <- bytes.Join([][]byte{[]byte(cliReq.kvp.key), value}, []byte(","))
+				select {
+				case kvs.broadcastChan <- bytes.Join([][]byte{[]byte(cliReq.kvp.key), value}, []byte(",")):
+				case <-kvs.updateDone:
+					return
+				}
+
 			default:
-				panic("something when wrong with cliReq producer")
+				panic("something wrong")
 			}
 		}
 	}
